@@ -14,14 +14,16 @@
 #define TRIG 0x02  // PE1
 #define ECHO 0x04  // PE2
 
-//change PWM approximately every 30 ms, measure sonar every two steps.
-#define PWM_STEP_US 30000U // do 30ms delay
-#define HOLD_TIME_US 1000000U
+
+#define HOLD_TIME_US        5000000
+#define PWM_STEP_US         100000
+#define SLOW_START_DUTY     70
+#define SLOW_STEP_US        3000000
 
 #define RISE_THRESHOLD_MM 10.0f
 #define FALL_THRESHOLD_MM 10.0f
 
-#define ECHO_TIMEOUT_TICKS 1200000U
+#define ECHO_TIMEOUT_TICKS 1200000
 
 
 #define GREEN_LED    (*((volatile uint32_t *)(0x42000000 + (0x400253FC-0x40000000)*32 + 3*4)))
@@ -56,6 +58,7 @@ void init_echo_interrupt(void);
 void GPIOPortE_Handler(void);
 uint8_t readDistanceMm(float *distance);
 void printDistanceMm(float distance);
+uint8_t readAvgDistanceMm(float *avg, uint8_t samples);
 int main(void)
 {
     initHw();
@@ -75,13 +78,13 @@ int main(void)
     int fallDuty = -1;
     uint8_t invalidReadings = 0;
 
-    //fan stopped. Wait 5 seconds, then record bottom position.
+
     dutyCycle = 0;
     setPWMduty(dutyCycle);
     putsUart0("Fan stopped. Waiting 5 seconds...\r\n");
     waitMicrosecond(HOLD_TIME_US);
 
-    if (!readDistanceMm(&bottomDistance))
+    if (!readAvgDistanceMm(&bottomDistance, 5))
     {
         putsUart0("Cannot read bottom position. Stopping.\r\n");
         setPWMduty(0);
@@ -92,115 +95,55 @@ int main(void)
     printDistanceMm(bottomDistance);
     putsUart0("Increasing PWM...\r\n");
 
-    //LOOP 1: Increase PWM until the plunger starts rising
-       for (int duty = 50; duty <= 100; duty++)
-       {
-           dutyCycle = (uint8_t)duty;
-           setPWMduty(dutyCycle);
-
-           waitMicrosecond(PWM_STEP_US); // 50 ms
-
-           //hold for 5 seconds while gradually increasing through 50%-100% duty cycle.
-           if (duty >= 50 && duty <= 100 && duty % 5 == 0)
-           {
-               putsUart0("Holding PWM at ");
-               printUint32(duty);
-               putsUart0("%\r\n");
-
-               uint32_t holdStart = WTIMER0_TAV_R;
-
-               while ((uint32_t)(WTIMER0_TAV_R - holdStart) < 200000000U)
-               {
-                   waitMicrosecond(60000);
-
-                   if (readDistanceMm(&distance))
-                   {
-                       putsUart0("Distance: ");
-                       printDistanceMm(distance);
-
-                       if (distance <= bottomDistance - RISE_THRESHOLD_MM)
-                       {
-                           riseDuty = duty;
-                           riseDistance = distance;
-
-                           putsUart0("Plunger started rising!\r\n");
-                           break;
-                       }
-                   }
-               }
-
-               //exit the rising loop if movement was detected
-               if (riseDuty >= 0)
-                   break;
-           }
-
-           //read ultrasonic sensor every two PWM steps
-           if ((duty % 2) != 0)
-               continue;
-
-           if (!readDistanceMm(&distance))
-           {
-               putsUart0("Echo timeout while increasing\r\n");
-
-               if (++invalidReadings >= 3)
-               {
-                   setPWMduty(0);
-                   putsUart0("Sensor lost. Fan stopped.\r\n");
-                   return 1;
-               }
-
-               continue;
-           }
-
-           invalidReadings = 0;
-
-           printDuty();
-           putsUart0("Distance: ");
-           printDistanceMm(distance);
-
-           //detect rising during the normal PWM ramp
-           if (distance <= bottomDistance - RISE_THRESHOLD_MM)
-           {
-               riseDuty = duty;
-               riseDistance = distance;
-
-               putsUart0("Plunger started rising!\r\n");
-               break;
-           }
-       }
-
-/*
-    if (riseDuty < 0)
+    //increase PWM until the plunger starts rising
+    for (int duty = 0; duty <= 99; duty++)
     {
-        dutyCycle = 100;
+        dutyCycle = (uint8_t)duty;
         setPWMduty(dutyCycle);
 
-        putsUart0("Holding PWM at 100%...\r\n");
 
-        uint32_t holdStart = WTIMER0_TAV_R;
+        uint32_t waitUs = (duty < SLOW_START_DUTY) ? PWM_STEP_US : SLOW_STEP_US;
+        uint32_t stepStart = WTIMER0_TAV_R;
+        uint8_t haveReading = 0;
 
-        // Hold for up to 10 additional seconds
-        while ((uint32_t)(WTIMER0_TAV_R - holdStart) < 400000000U)
+        while ((uint32_t)(WTIMER0_TAV_R - stepStart) < (waitUs * 40))
         {
+            waitMicrosecond(PWM_STEP_US);
+
             if (readDistanceMm(&distance))
             {
-                putsUart0("Distance: ");
-                printDistanceMm(distance);
+                haveReading = 1;
+                invalidReadings = 0;
 
                 if (distance <= bottomDistance - RISE_THRESHOLD_MM)
                 {
-                    riseDuty = 100;
+                    riseDuty = duty;
                     riseDistance = distance;
-
-                    putsUart0("Plunger started rising!\r\n");
                     break;
                 }
             }
+            else if (++invalidReadings >= 3)
+            {
+                setPWMduty(0);
+                putsUart0("Sensor lost. Fan stopped.\r\n");
+                return 1;
+            }
+        }
 
-            waitMicrosecond(60000);
+        printDuty();
+        if (haveReading)
+        {
+            putsUart0("Distance: ");
+            printDistanceMm(distance);
+        }
+
+        if (riseDuty >= 0)
+        {
+            putsUart0("Plunger started rising!\r\n");
+            break;
         }
     }
-*/
+
     if (riseDuty < 0)
     {
         putsUart0("Rise not detected. Stopping.\r\n");
@@ -208,13 +151,12 @@ int main(void)
         return 1;
     }
 
-    // STEP 2: Run fan at 100%, wait 5 seconds, measure top position.
     dutyCycle = 100;
     setPWMduty(dutyCycle);
     putsUart0("Fan at 100%. Waiting 5 seconds...\r\n");
     waitMicrosecond(HOLD_TIME_US);
 
-    if (!readDistanceMm(&topDistance))
+    if (!readAvgDistanceMm(&topDistance, 5))
     {
         putsUart0("Cannot read top position. Stopping.\r\n");
         setPWMduty(0);
@@ -225,7 +167,7 @@ int main(void)
     printDistanceMm(topDistance);
     putsUart0("Decreasing PWM...\r\n");
 
-    // LOOP 2: Decrease PWM 1% per step until the plunger starts to fall.
+
     invalidReadings = 0;
     for (int duty = 99; duty >= 0; duty--)
     {
@@ -233,11 +175,6 @@ int main(void)
         setPWMduty(dutyCycle);
         waitMicrosecond(PWM_STEP_US);
 
-        /*
-        // Read sonar every two PWM steps, rather than every 30 ms.
-        if ((duty % 2) != 0)
-            continue;
-*/
         if (!readDistanceMm(&distance))
         {
             putsUart0("Echo timeout while decreasing\r\n");
@@ -260,11 +197,11 @@ int main(void)
             fallDuty = duty;
             fallDistance = distance;
             putsUart0("Plunger started falling!\r\n");
-            break; // Stop the decrease as soon as falling is detected
+            break;
         }
     }
 
-    setPWMduty(0); // Stop the fan at end of experiment
+    setPWMduty(0);
     dutyCycle = 0;
 
     putsUart0("\r\nDONE!\r\n");
@@ -553,6 +490,30 @@ void printDistanceMm(float distance)
 
     printUint32(scaled % 100);
     putsUart0(" mm\r\n");
+}
+
+
+uint8_t readAvgDistanceMm(float *avg, uint8_t samples)
+{
+    float sum = 0.0f;
+    uint8_t good = 0;
+
+    for (uint8_t i = 0; i < samples; i++)
+    {
+        float d;
+        waitMicrosecond(60000);
+        if (readDistanceMm(&d))
+        {
+            sum += d;
+            good++;
+        }
+    }
+
+    if (good == 0)
+        return 0;
+
+    *avg = sum / good;
+    return 1;
 }
 
 
